@@ -14,11 +14,15 @@ typedef struct Euler {
   float yaw;
 } Euler_t;
 Euler_t pose;
+Euler_t gyro_pose;
 
-Matrix<4> x;    //state vector 
+
+const float alpha = 0.03;
+
+Matrix<4> x;    //state vector
 Matrix<4, 4> A; //state transition mat
 Matrix<4, 2> B; //control mat
-Matrix<4, 4> P; //state uncertainty cov  
+Matrix<4, 4> P; //state uncertainty cov
 Matrix<4, 4> Q; //model noise
 Matrix<2, 2> R; //sensor noise
 Matrix<2, 4> H; //observation transform
@@ -42,16 +46,16 @@ void readGyro(float &GX, float &GY, float &GZ) {
   Wire.requestFrom(IMU, 6, true);
   GX = (((float)(Wire.read() << 8 | Wire.read())) / GYRO_FSR);
   GY = (((float)(Wire.read() << 8 | Wire.read())) / GYRO_FSR);
-  GZ = (((float)(Wire.read() << 8 | Wire.read())) / GYRO_FSR); 
+  GZ = (((float)(Wire.read() << 8 | Wire.read())) / GYRO_FSR);
 }
-// Undergo a static callibration period of 100 readings 
+// Undergo a static callibration period of 100 readings
 void callibrate() {
   GX_Cor = 0;
   GY_Cor = 0;
   GZ_Cor = 0;
-  
-  for(int i = 0; i < 100; i++) {
-    float GX,GY,GZ;
+
+  for (int i = 0; i < 100; i++) {
+    float GX, GY, GZ;
     readGyro(GX, GY, GZ);
     GX_Cor += GX;
     GY_Cor += GY;
@@ -65,16 +69,18 @@ void callibrate() {
 //Construct a diagonal matrix
 template <int q>
 inline void setDiag(Matrix<q, q> &a, float val) {
-  for(int i = 0; i < q; i++) a(i, i) = val;
+  for (int i = 0; i < q; i++) a(i, i) = val;
 }
 
 void setup() {
   pose.pitch = 0;
   pose.roll = 0;
   pose.yaw = 0;
-  
+  gyro_pose.pitch = 0;
+  gyro_pose.roll = 0;
+
   // one time I2C setup
-  Serial.begin(9600);
+  Serial.begin(115200);
   //Wire.setClock(400000UL);
   Wire.begin();
 
@@ -85,14 +91,14 @@ void setup() {
 
   // set accel FSR to 4g
   Wire.beginTransmission(IMU);
-  Wire.write(0x1C); 
-  Wire.write(0x08);          
+  Wire.write(0x1C);
+  Wire.write(0x08);
   Wire.endTransmission();
 
   // set gyro FSR to 250 dps
   Wire.beginTransmission(IMU);
-  Wire.write(0x1B); 
-  Wire.write(0x00);          
+  Wire.write(0x1B);
+  Wire.write(0x00);
   Wire.endTransmission();
 
   //callibration
@@ -103,19 +109,19 @@ void setup() {
   setDiag<4>(Q, 1);
   setDiag<2>(R, 1);
   H << 1, 0, 0, 0,
-       0, 0, 1, 0;
-  
-  prevTime = millis()/1000.0;
+  0, 0, 1, 0;
+
+  prevTime = millis() / 1000.0;
 }
 
 void loop() {
-  // dt timer 
-  float curTime = millis()/1000.0;
+  // dt timer
+  float curTime = millis() / 1000.0;
   float dt = curTime - prevTime;
   prevTime = curTime;
 
-  // read raw values 
-  float AX,AY,AZ,GX,GY,GZ;
+  // read raw values
+  float AX, AY, AZ, GX, GY, GZ;
   readAccel(AX, AY, AZ);
   readGyro(GX, GY, GZ);
 
@@ -125,38 +131,57 @@ void loop() {
   Matrix<2, 1> u;
   u << GX, GZ;
 
+  //form A and B state space matricies
+  A.Fill(0);
+  setDiag<4>(A, 1);
+  A(0, 1) = -dt;
+  A(2, 3) = -dt;
+  B.Fill(0);
+  B(0, 0) = dt;
+  B(2, 1) = dt;
+
   //Prediction step in state space
-  x = A*x + B*u;
-  P = A*P*(~A) + Q;
+  x = A * x + B * u;
+  P = A * P * (~A) + Q;
 
   //sensor reading
   Matrix<2, 1> z;
-  z << atan(AY/sqrt(AX*AX+AZ*AZ)) * 180/PI, atan(-AX/sqrt(AY*AY+AZ*AZ)) * 180/PI;
+  float accelPitchPred = atan2(AY, sqrt(AX * AX + AZ * AZ)) * 180 / PI;
+  float accelRollPred =  atan2(-AX, sqrt(AY * AY + AZ * AZ)) * 180 / PI;
+  z << accelPitchPred, accelRollPred;
   //innovation
-  Matrix<2, 1> y = z - H*x;
-  //sensor space transform and sensor noise                                            
-  Matrix<2, 2> S = H*P*(~H) + R;
+  Matrix<2, 1> y = z - H * x;
+  //sensor space transform and sensor noise
+  Matrix<2, 2> S = H * P * (~H) + R;
   //kalman gain
-  Matrix<4, 2> K = P*(~H)*Invert(S);
+  Matrix<4, 2> K = P * (~H) * Invert(S);
 
   //Update step
-  x = x + K*y;
-  P = P - K*H*P;
-  
-  
-  // Logging
-  //Serial.print(GX);
-  //Serial.print(",");
-  //Serial.println(GY);
-  
-  Serial.print(x(0, 0));
-  Serial.print(" ");
-  Serial.print(x(2, 0));
-  Serial.print(" ");
-  Serial.print("****");
-  Serial.print(z(0, 0));
-  Serial.print(" ");
-  Serial.print(z(1, 0));
-  Serial.println("");  
+  x = x + K * y;
+  P = P - K * H * P;
 
+  //Complimentary filter for comparison
+  pose.pitch = (1 - alpha) * (pose.pitch + (GX - GX_Cor) * dt) + alpha * accelPitchPred;
+  pose.roll = (1 - alpha) * (pose.roll + (GZ - GZ_Cor) * dt) + alpha * accelRollPred;
+
+  //Raw gyroscope integration for comparison
+  gyro_pose.pitch += (GX - GX_Cor) * dt;
+  gyro_pose.roll += (GZ - GZ_Cor) * dt;
+
+  // Logging
+  /*
+  Serial.print("Accel:");
+  Serial.print(accelPitchPred);
+  Serial.print(",");
+  Serial.print("Complimentary:");
+  Serial.print(pose.pitch);
+  Serial.print(",");
+  Serial.print("Gyroscope:");
+  Serial.print( gyro_pose.pitch);
+  Serial.println("");
+  */
+  Serial.print("Pitch: ");
+  Serial.print(accelPitchPred);
+  Serial.print(" Roll: ");
+  Serial.println(accelRollPred);
 }
